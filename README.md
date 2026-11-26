@@ -6,7 +6,7 @@ promote images, shared by every app repo.
 | Workflow | Trigger (in the caller) | What it does |
 |---|---|---|
 | `docker-ci.yml` | PRs and pushes to `main` | actionlint, hadolint, `compose config`, builds every image, runs `scripts/ci-test.sh` and `scripts/smoke-test.sh` against the built images |
-| `docker-candidate.yml` | `vX.Y.Z-rc.N` tag | *(coming next)* multi-arch build → GHCR → scan → smoke test → prerelease |
+| `docker-candidate.yml` | `vX.Y.Z-rc.N` tag on main | native amd64/arm64 builds → `ghcr.io/<owner>/<repo>/<name>:vX.Y.Z-rc.N` + provenance attestation → smoke test on every platform against the published images → Trivy → GitHub prerelease with `images.json` |
 | `docker-promote.yml` | manual | *(coming next)* promote a tested RC digest to `vX.Y.Z` + `latest` without rebuilding |
 
 ## Using `docker-ci.yml`
@@ -43,6 +43,30 @@ Both scripts get `IMAGE_<NAME>` (upper-cased, `-` → `_`) pointing at the image
 built in this run, so they test the artifact, not the source tree. The smoke
 script should be written so it also works with published images; release
 candidates reuse it.
+
+## Using `docker-candidate.yml`
+
+```yaml
+# .github/workflows/release-candidate.yml
+name: release-candidate
+on:
+  push:
+    tags: ["v*-rc.*"]
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+jobs:
+  candidate:
+    uses: christancho/github-workflows/.github/workflows/docker-candidate.yml@v1.1.0
+    with:
+      images: '[{"name":"api","context":".","dockerfile":"api/Dockerfile"}]'
+```
+
+Cut an RC: `git tag v1.2.0-rc.1 origin/main && git push origin v1.2.0-rc.1`.
+Verify an image: `gh attestation verify oci://<image>@<digest> -R <owner>/<repo> --signer-repo christancho/github-workflows`
+(the signer is this repo, because the build runs in the reusable workflow).
 
 ## Conventions
 
