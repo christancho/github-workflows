@@ -1,0 +1,127 @@
+# Reusable Docker CI: lint, build every image once, run the repo's tests and
+# smoke test against the images that were just built.
+#
+# Caller (in the app repo, .github/workflows/ci.yml):
+#   jobs:
+#     docker:
+#       uses: christancho/github-workflows/.github/workflows/docker-ci.yml@v1.0.0
+#       with:
+#         images: '[{"name":"api","context":".","dockerfile":"api/Dockerfile"}]'
+#
+# Repo conventions (both optional, skipped with a notice when absent):
+#   scripts/ci-test.sh     unit/integration tests, run against the built images
+#   scripts/smoke-test.sh  boots the stack from the built images and checks it
+# Both receive IMAGE_<NAME>=<local tag> per image (name upper-cased, - -> _).
+name: docker-ci
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: >-
+          JSON list of images. Each entry: name, context (dir), dockerfile
+          (path relative to context, default "Dockerfile").
+        type: string
+        required: true
+      compose-files:
+        description: Space-separated compose files checked with `docker compose config`.
+        type: string
+        default: ""
+      test-script:
+        type: string
+        default: scripts/ci-test.sh
+      smoke-script:
+        type: string
+        default: scripts/smoke-test.sh
+      runner:
+        description: Runner label. Keep GitHub-hosted for public repos (fork PRs run here).
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint (shellcheck warnings and errors fail, info notes don't)
+        run: docker run --rm -e SHELLCHECK_OPTS="-S warning" -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+      - name: hadolint (errors fail, warnings are shown)
+        env:
+          IMAGES: ${{ inputs.images }}
+        run: |
+          status=0
+          while IFS= read -r df; do
+            echo "::group::hadolint $df"
+            docker run --rm -i hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d hadolint --failure-threshold error - < "$df" || status=1
+            echo "::endgroup::"
+          done < <(jq -r '.[] | (.context // ".") + "/" + (.dockerfile // "Dockerfile")' <<<"$IMAGES")
+          exit $status
+
+      - name: docker compose config
+        if: inputs.compose-files != ''
+        env:
+          COMPOSE_FILES: ${{ inputs.compose-files }}
+        run: |
+          envfile=()
+          [ -f .env.example ] && envfile=(--env-file .env.example)
+          for f in $COMPOSE_FILES; do
+            echo "checking $f"
+            docker compose "${envfile[@]}" -f "$f" config --quiet
+          done
+
+  build-test:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Plan images
+        env:
+          IMAGES: ${{ inputs.images }}
+        run: |
+          # One bake target per image, loaded into the local docker engine,
+          # with its own GitHub Actions cache scope.
+          jq '{
+            group: {default: {targets: [.[].name]}},
+            target: (map({key: .name, value: {
+              context: (.context // "."),
+              dockerfile: (.dockerfile // "Dockerfile"),
+              tags: ["ci/\(.name):test"],
+              "cache-from": ["type=gha,scope=\(.name)"],
+              "cache-to": ["type=gha,mode=max,scope=\(.name)"],
+              output: ["type=docker"]
+            }}) | from_entries)
+          }' <<<"$IMAGES" > "$RUNNER_TEMP/docker-bake.json"
+          jq -r '.[] | "IMAGE_\(.name | ascii_upcase | gsub("[^A-Z0-9]"; "_"))=ci/\(.name):test"' <<<"$IMAGES" >> "$GITHUB_ENV"
+
+      - name: Build
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          files: ${{ runner.temp }}/docker-bake.json
+
+      - name: Tests
+        env:
+          SCRIPT: ${{ inputs.test-script }}
+        run: |
+          if [ ! -f "$SCRIPT" ]; then echo "::notice::$SCRIPT not found, no tests run"; exit 0; fi
+          bash "$SCRIPT"
+
+      - name: Smoke test
+        env:
+          SCRIPT: ${{ inputs.smoke-script }}
+        run: |
+          if [ ! -f "$SCRIPT" ]; then echo "::notice::$SCRIPT not found, no smoke test run"; exit 0; fi
+          bash "$SCRIPT"
