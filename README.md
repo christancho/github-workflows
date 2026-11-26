@@ -7,7 +7,7 @@ promote images, shared by every app repo.
 |---|---|---|
 | `docker-ci.yml` | PRs and pushes to `main` | actionlint, hadolint, `compose config`, builds every image, runs `scripts/ci-test.sh` and `scripts/smoke-test.sh` against the built images |
 | `docker-candidate.yml` | `vX.Y.Z-rc.N` tag on main | native amd64/arm64 builds → `ghcr.io/<owner>/<repo>/<name>:vX.Y.Z-rc.N` + provenance attestation → smoke test on every platform against the published images → Trivy → GitHub prerelease with `images.json` |
-| `docker-promote.yml` | manual | *(coming next)* promote a tested RC digest to `vX.Y.Z` + `latest` without rebuilding |
+| `docker-promote.yml` | manual (`workflow_dispatch`) | checks the RC (prerelease exists, its run passed, digests unmoved, provenance verifies, version unreleased), then re-tags the **same digests** `vX.Y.Z` (+ `latest` if newest) and publishes the stable release with `images.json`. `dry-run` = checks only |
 
 ## Using `docker-ci.yml`
 
@@ -67,6 +67,31 @@ jobs:
 Cut an RC: `git tag v1.2.0-rc.1 origin/main && git push origin v1.2.0-rc.1`.
 Verify an image: `gh attestation verify oci://<image>@<digest> -R <owner>/<repo> --signer-repo christancho/github-workflows`
 (the signer is this repo, because the build runs in the reusable workflow).
+
+## Using `docker-promote.yml`
+
+```yaml
+# .github/workflows/promote.yml
+name: promote
+on:
+  workflow_dispatch:
+    inputs:
+      candidate: { description: "RC to promote, e.g. v1.4.0-rc.2", required: true, type: string }
+      dry-run: { description: "Only run the checks", type: boolean, default: false }
+permissions:
+  contents: write
+  packages: write
+  attestations: read
+jobs:
+  promote:
+    uses: christancho/github-workflows/.github/workflows/docker-promote.yml@v1.2.0
+    with:
+      candidate: ${{ inputs.candidate }}
+      dry-run: ${{ inputs.dry-run }}
+```
+
+Run it: Actions → promote → Run workflow (from `main`), or
+`gh workflow run promote.yml -f candidate=v1.4.0-rc.2`. Only admins/maintainers pass the checks.
 
 ## Conventions
 
