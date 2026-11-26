@@ -10,7 +10,7 @@
 #             - each RC tag still points at the recorded digest (not moved)
 #             - each digest has a valid provenance attestation from the signer repo
 #             - vX.Y.Z isn't tagged/released yet, and no image vX.Y.Z tag points elsewhere
-#   promote   crane tags digest -> vX.Y.Z (+ latest), re-checks the digests,
+#   promote   crane tags digest -> vX.Y.Z (+ latest and stable if newest), re-checks the digests,
 #             creates git tag vX.Y.Z at the RC commit, publishes the stable release
 #             with images.json (the deploy record)
 #
@@ -187,12 +187,15 @@ jobs:
         run: |
           while read -r name image digest; do
             crane tag "$image@$digest" "$STABLE"
-            [ "$LATEST" = true ] && crane tag "$image@$digest" latest
-            for t in "$STABLE" $([ "$LATEST" = true ] && echo latest); do
+            if [ "$LATEST" = true ]; then
+              crane tag "$image@$digest" latest
+              crane tag "$image@$digest" stable
+            fi
+            for t in "$STABLE" $([ "$LATEST" = true ] && echo latest stable); do
               got=$(crane digest "$image:$t")
               [ "$got" = "$digest" ] || { echo "::error::$image:$t is $got, expected $digest"; exit 1; }
             done
-            echo "$name: $image:$STABLE = $digest$([ "$LATEST" = true ] && echo ' (also latest)')"
+            echo "$name: $image:$STABLE = $digest$([ "$LATEST" = true ] && echo ' (also latest, stable)')"
           done < <(jq -r '.images[] | "\(.name) \(.image) \(.digest)"' "$RUNNER_TEMP/images.json")
 
       - name: Tag commit and publish release

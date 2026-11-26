@@ -7,6 +7,8 @@
 #   smoke     the app's smoke test against the PUBLISHED images, on every platform
 #   scan      Trivy (fails on fixable vulnerabilities at the given severities)
 #   release   GitHub prerelease with images.json (refs + digests + commit) as asset
+#   channel   moves the `stg` tag (input `channel`) to these digests, so stacks
+#             following :stg pick the RC up. Only after the prerelease exists.
 #
 # The prerelease is created only when everything above passed, and
 # docker-promote.yml only promotes prereleases, so a failed RC can't be promoted.
@@ -44,6 +46,10 @@ on:
         description: Trivy severities that fail the RC (only vulnerabilities with a fix count).
         type: string
         default: CRITICAL
+      channel:
+        description: Channel tag moved to every RC that passes. Empty = don't move any.
+        type: string
+        default: stg
       runner:
         description: Runner for the platform-independent jobs.
         type: string
@@ -334,3 +340,49 @@ jobs:
           } > "$out/notes.md"
           gh release create "$VERSION" "$out/images.json" -R "$GITHUB_REPOSITORY" \
             --verify-tag --prerelease --title "$VERSION" --notes-file "$out/notes.md"
+
+  channel:
+    needs: [validate, release]
+    if: inputs.channel != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: ${{ runner.temp }}/images
+          merge-multiple: true
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Install crane
+        env:
+          CRANE_VERSION: v0.22.1
+          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/crane.tgz" \
+            "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/crane.tgz" -C "$RUNNER_TEMP" crane
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Move channel tag (no rebuild)
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.json; do
+            image=$(jq -r .image "$f"); digest=$(jq -r .digest "$f")
+            crane tag "$image@$digest" "$CHANNEL"
+            got=$(crane digest "$image:$CHANNEL")
+            [ "$got" = "$digest" ] || { echo "::error::$image:$CHANNEL is $got, expected $digest"; exit 1; }
+            echo "$image:$CHANNEL -> $VERSION ($digest)"
+          done
+          echo "### \`$CHANNEL\` now serves \`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"

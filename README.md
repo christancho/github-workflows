@@ -6,8 +6,9 @@ promote images, shared by every app repo.
 | Workflow | Trigger (in the caller) | What it does |
 |---|---|---|
 | `docker-ci.yml` | PRs and pushes to `main` | actionlint, hadolint, `compose config`, builds every image, runs `scripts/ci-test.sh` and `scripts/smoke-test.sh` against the built images |
-| `docker-candidate.yml` | `vX.Y.Z-rc.N` tag on main | native amd64/arm64 builds → `ghcr.io/<owner>/<repo>/<name>:vX.Y.Z-rc.N` + provenance attestation → smoke test on every platform against the published images → Trivy → GitHub prerelease with `images.json` |
-| `docker-promote.yml` | manual (`workflow_dispatch`) | checks the RC (prerelease exists, its run passed, digests unmoved, provenance verifies, version unreleased), then re-tags the **same digests** `vX.Y.Z` (+ `latest` if newest) and publishes the stable release with `images.json`. `dry-run` = checks only |
+| `docker-candidate.yml` | `vX.Y.Z-rc.N` tag on main | native amd64/arm64 builds → `ghcr.io/<owner>/<repo>/<name>:vX.Y.Z-rc.N` + provenance attestation → smoke test on every platform against the published images → Trivy → GitHub prerelease with `images.json` → moves the `stg` tag |
+| `docker-channel.yml` | manual | points `stg` or `stable` at an already released version (rollback, seeding); verifies release, digests and provenance first |
+| `docker-promote.yml` | manual (`workflow_dispatch`) | checks the RC (prerelease exists, its run passed, digests unmoved, provenance verifies, version unreleased), then re-tags the **same digests** `vX.Y.Z` (+ `latest` and `stable` if newest) and publishes the stable release with `images.json`. `dry-run` = checks only |
 
 ## Using `docker-ci.yml`
 
@@ -92,6 +93,36 @@ jobs:
 
 Run it: Actions → promote → Run workflow (from `main`), or
 `gh workflow run promote.yml -f candidate=v1.4.0-rc.2`. Only admins/maintainers pass the checks.
+
+## Channels
+
+| Tag | Moves when | Typical user |
+|---|---|---|
+| `stg` | an RC passes (docker-candidate) or by hand (docker-channel) | the maintainer's own instance |
+| `stable` / `latest` | promote (newest stable only) or by hand (docker-channel) | people installing the app |
+| `vX.Y.Z`, `vX.Y.Z-rc.N` | never (immutable) | pinning, dev stacks |
+
+Caller for rollback:
+
+```yaml
+# .github/workflows/channel.yml
+name: channel
+on:
+  workflow_dispatch:
+    inputs:
+      version: { description: "Released version, e.g. v1.0.0 or v1.1.0-rc.2", required: true, type: string }
+      channel: { type: choice, options: [stg, stable], default: stg }
+permissions:
+  contents: read
+  packages: write
+  attestations: read
+jobs:
+  channel:
+    uses: christancho/github-workflows/.github/workflows/docker-channel.yml@v1.3.0
+    with:
+      version: ${{ inputs.version }}
+      channel: ${{ inputs.channel }}
+```
 
 ## Conventions
 

@@ -1,0 +1,117 @@
+# Reusable "move a channel tag" workflow: point stg or stable at the images of
+# an already released version. Used for rollback (stable -> previous version,
+# stg -> an older RC) and to seed channels. Never builds anything.
+#
+# Refuses unless: run from the default branch by an admin/maintainer, the version
+# has a GitHub release with images.json (= it passed its RC checks), stable only
+# takes stable releases, each version tag still points at the recorded digest,
+# and each digest's provenance verifies.
+#
+# Caller (.github/workflows/channel.yml):
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         version: { description: "Released version, e.g. v1.0.0 or v1.1.0-rc.2", required: true, type: string }
+#         channel: { type: choice, options: [stg, stable], default: stg }
+#   permissions: { contents: read, packages: write, attestations: read }
+#   jobs:
+#     channel:
+#       uses: christancho/github-workflows/.github/workflows/docker-channel.yml@v1.3.0
+#       with:
+#         version: ${{ inputs.version }}
+#         channel: ${{ inputs.channel }}
+name: docker-channel
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      channel:
+        type: string
+        required: true
+      signer-repo:
+        type: string
+        default: christancho/github-workflows
+      runner:
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: channel-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CRANE_VERSION: v0.22.1
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+
+jobs:
+  move:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      attestations: read
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Install crane
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/crane.tgz" \
+            "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/crane.tgz" -C "$RUNNER_TEMP" crane
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Check and move
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          SIGNER: ${{ inputs.signer-repo }}
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          fail() { echo "::error::REFUSED: $*"; echo "### REFUSED: $*" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          ok() { echo "ok  $*"; echo "- ✅ $*" >> "$GITHUB_STEP_SUMMARY"; }
+          echo "## Point \`$CHANNEL\` at \`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ] || fail "run this from $DEFAULT_BRANCH (got $REF)"
+          perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission)
+          [[ "$perm" == admin || "$perm" == maintain ]] || fail "$ACTOR has '$perm'; needs admin or maintain"
+          [[ "$CHANNEL" =~ ^(stg|stable)$ ]] || fail "channel must be stg or stable"
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || fail "$VERSION is not vX.Y.Z or vX.Y.Z-rc.N"
+          ok "started by $ACTOR ($perm) from $DEFAULT_BRANCH"
+
+          rel=$(gh release view "$VERSION" -R "$REPO" --json isPrerelease,isDraft 2>/dev/null) \
+            || fail "$VERSION has no release (it never passed its checks)"
+          [ "$(jq -r .isDraft <<<"$rel")" = false ] || fail "$VERSION release is a draft"
+          if [ "$CHANNEL" = stable ] && [ "$(jq -r .isPrerelease <<<"$rel")" = true ]; then
+            fail "stable only takes stable releases; $VERSION is a release candidate"
+          fi
+          gh release download "$VERSION" -R "$REPO" -p images.json -O "$RUNNER_TEMP/images.json" \
+            || fail "$VERSION release has no images.json"
+          ok "$VERSION is a released version"
+
+          while read -r name image digest; do
+            got=$(crane digest "$image:$VERSION") || fail "$image:$VERSION not found"
+            [ "$got" = "$digest" ] || fail "$image:$VERSION moved: $got, recorded $digest"
+            gh attestation verify "oci://$image@$digest" -R "$REPO" --signer-repo "$SIGNER" >/dev/null \
+              || fail "$name: provenance of $digest doesn't verify"
+            before=$(crane digest "$image:$CHANNEL" 2>/dev/null || echo none)
+            crane tag "$image@$digest" "$CHANNEL"
+            [ "$(crane digest "$image:$CHANNEL")" = "$digest" ] || fail "$image:$CHANNEL didn't move"
+            ok "$name: $CHANNEL ${before:0:19} -> ${digest:0:19}"
+          done < <(jq -r '.images[] | "\(.name) \(.image) \(.digest)"' "$RUNNER_TEMP/images.json")
+          echo "### \`$CHANNEL\` now serves \`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
