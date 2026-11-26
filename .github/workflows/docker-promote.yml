@@ -1,0 +1,217 @@
+# Reusable promotion workflow: turn a validated release candidate into a
+# stable release WITHOUT rebuilding. The exact RC image digests get the
+# vX.Y.Z (and, if it's the newest stable, latest) tags.
+#
+#   validate  (also runs in dry-run) refuses unless ALL hold:
+#             - run from the default branch by an admin/maintainer
+#             - candidate is vX.Y.Z-rc.N and has a GitHub PRERELEASE (only created
+#               by docker-candidate after build, smoke, scan all passed)
+#             - its candidate run concluded success, on the tag's commit
+#             - each RC tag still points at the recorded digest (not moved)
+#             - each digest has a valid provenance attestation from the signer repo
+#             - vX.Y.Z isn't tagged/released yet, and no image vX.Y.Z tag points elsewhere
+#   promote   crane tags digest -> vX.Y.Z (+ latest), re-checks the digests,
+#             creates git tag vX.Y.Z at the RC commit, publishes the stable release
+#             with images.json (the deploy record)
+#
+# Caller (.github/workflows/promote.yml):
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         candidate: { description: "RC to promote, e.g. v1.4.0-rc.2", required: true, type: string }
+#         dry-run:   { description: "Only run the checks", type: boolean, default: false }
+#   permissions: { contents: write, packages: write, attestations: read }
+#   jobs:
+#     promote:
+#       uses: christancho/github-workflows/.github/workflows/docker-promote.yml@v1.2.0
+#       with:
+#         candidate: ${{ inputs.candidate }}
+#         dry-run: ${{ inputs.dry-run }}
+name: docker-promote
+
+on:
+  workflow_call:
+    inputs:
+      candidate:
+        type: string
+        required: true
+      dry-run:
+        type: boolean
+        default: false
+      signer-repo:
+        description: Repo whose workflow signed the build provenance.
+        type: string
+        default: christancho/github-workflows
+      runner:
+        type: string
+        default: ubuntu-latest
+    outputs:
+      version:
+        value: ${{ jobs.validate.outputs.stable }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CRANE_VERSION: v0.22.1
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+
+jobs:
+  validate:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    outputs:
+      stable: ${{ steps.check.outputs.stable }}
+      commit: ${{ steps.check.outputs.commit }}
+      latest: ${{ steps.check.outputs.latest }}
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Install crane
+        run: &crane |
+          curl -sSfL -o "$RUNNER_TEMP/crane.tgz" \
+            "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/crane.tgz" -C "$RUNNER_TEMP" crane
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CANDIDATE: ${{ inputs.candidate }}
+          SIGNER: ${{ inputs.signer-repo }}
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          fail() { echo "::error::REFUSED: $*"; echo "### REFUSED: $*" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          ok() { echo "ok  $*"; echo "- ✅ $*" >> "$GITHUB_STEP_SUMMARY"; }
+          echo "## Promotion checks for \`$CANDIDATE\`" >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ] || fail "run this from $DEFAULT_BRANCH (got $REF)"
+          perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission)
+          [[ "$perm" == admin || "$perm" == maintain ]] || fail "$ACTOR has '$perm'; promotion needs admin or maintain"
+          ok "started by $ACTOR ($perm) from $DEFAULT_BRANCH"
+
+          [[ "$CANDIDATE" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-rc\.[0-9]+$ ]] || fail "$CANDIDATE is not vX.Y.Z-rc.N"
+          stable=${BASH_REMATCH[1]}
+
+          rel=$(gh release view "$CANDIDATE" -R "$REPO" --json isPrerelease,isDraft 2>/dev/null) \
+            || fail "$CANDIDATE has no release: its candidate run failed or hasn't finished"
+          [ "$(jq -r '.isPrerelease and (.isDraft|not)' <<<"$rel")" = true ] || fail "$CANDIDATE release is not a published prerelease"
+          ok "validated prerelease exists"
+
+          gh release download "$CANDIDATE" -R "$REPO" -p images.json -O "$RUNNER_TEMP/images.json" \
+            || fail "$CANDIDATE prerelease has no images.json"
+          commit=$(gh api "repos/$REPO/commits/$CANDIDATE" --jq .sha)
+          [ "$(jq -r .version "$RUNNER_TEMP/images.json")" = "$CANDIDATE" ] || fail "images.json is for another version"
+          [ "$(jq -r .commit "$RUNNER_TEMP/images.json")" = "$commit" ] || fail "images.json commit differs from tag commit $commit"
+          run_id=$(jq -r '.run | split("/") | last' "$RUNNER_TEMP/images.json")
+          run=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '{conclusion, head_sha, head_branch}')
+          [ "$(jq -r .conclusion <<<"$run")" = success ] || fail "candidate run $run_id concluded $(jq -r .conclusion <<<"$run")"
+          [ "$(jq -r .head_sha <<<"$run")" = "$commit" ] || fail "candidate run $run_id built a different commit"
+          ok "candidate run $run_id succeeded on $commit"
+
+          if gh api "repos/$REPO/git/ref/tags/$stable" >/dev/null 2>&1; then fail "$stable is already tagged"; fi
+          if gh release view "$stable" -R "$REPO" >/dev/null 2>&1; then fail "$stable is already released"; fi
+          ok "$stable not tagged or released yet"
+
+          while read -r name image digest; do
+            got=$(crane digest "$image:$CANDIDATE") || fail "$image:$CANDIDATE not found"
+            [ "$got" = "$digest" ] || fail "$image:$CANDIDATE moved: $got, recorded $digest"
+            if existing=$(crane digest "$image:$stable" 2>/dev/null); then
+              [ "$existing" = "$digest" ] || fail "$image:$stable already points at $existing"
+            fi
+            gh attestation verify "oci://$image@$digest" -R "$REPO" --signer-repo "$SIGNER" >/dev/null \
+              || fail "$name: provenance of $digest doesn't verify"
+            ok "$name: $digest matches the RC tag, provenance verified"
+          done < <(jq -r '.images[] | "\(.name) \(.image) \(.digest)"' "$RUNNER_TEMP/images.json")
+
+          newest=$( { gh release list -R "$REPO" --limit 200 --json tagName,isPrerelease \
+                        --jq '.[] | select(.isPrerelease|not) | .tagName' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; echo "$stable"; } | sort -V | tail -1)
+          latest=false; [ "$newest" = "$stable" ] && latest=true
+          ok "promote to $stable (latest: $latest)"
+
+          { echo "stable=$stable"; echo "commit=$commit"; echo "latest=$latest"; } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-images
+          path: ${{ runner.temp }}/images.json
+          retention-days: 7
+
+  promote:
+    needs: validate
+    if: ${{ !inputs.dry-run }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      CANDIDATE: ${{ inputs.candidate }}
+      STABLE: ${{ needs.validate.outputs.stable }}
+      COMMIT: ${{ needs.validate.outputs.commit }}
+      LATEST: ${{ needs.validate.outputs.latest }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate-images
+          path: ${{ runner.temp }}
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Install crane
+        run: *crane
+
+      - name: Tag images (no rebuild)
+        run: |
+          while read -r name image digest; do
+            crane tag "$image@$digest" "$STABLE"
+            [ "$LATEST" = true ] && crane tag "$image@$digest" latest
+            for t in "$STABLE" $([ "$LATEST" = true ] && echo latest); do
+              got=$(crane digest "$image:$t")
+              [ "$got" = "$digest" ] || { echo "::error::$image:$t is $got, expected $digest"; exit 1; }
+            done
+            echo "$name: $image:$STABLE = $digest$([ "$LATEST" = true ] && echo ' (also latest)')"
+          done < <(jq -r '.images[] | "\(.name) \(.image) \(.digest)"' "$RUNNER_TEMP/images.json")
+
+      - name: Tag commit and publish release
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api "repos/$REPO/git/refs" -f ref="refs/tags/$STABLE" -f sha="$COMMIT" >/dev/null
+          out="$RUNNER_TEMP/release"; mkdir -p "$out"
+          jq --arg v "$STABLE" --arg rc "$CANDIDATE" --arg run "$RUN_URL" \
+            '.version = $v | .promoted_from = $rc | .promote_run = $run' "$RUNNER_TEMP/images.json" > "$out/images.json"
+          {
+            echo "Promoted from **$CANDIDATE** without rebuilding: same image digests, smoke-tested and scanned as the candidate."
+            echo
+            echo "| Image | Digest |"
+            echo "|---|---|"
+            jq -r --arg v "$STABLE" '.images[] | "| `\(.image):\($v)` | `\(.digest)` |"' "$out/images.json"
+            echo
+            echo "Deploy by digest; \`images.json\` is the record. [Promotion run]($RUN_URL)"
+          } > "$out/notes.md"
+          gh release create "$STABLE" "$out/images.json" -R "$REPO" --verify-tag \
+            --title "$STABLE" --latest="$LATEST" --notes-file "$out/notes.md" --generate-notes
+          echo "### Released $STABLE (from $CANDIDATE, latest: $LATEST)" >> "$GITHUB_STEP_SUMMARY"
