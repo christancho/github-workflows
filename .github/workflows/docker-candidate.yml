@@ -7,20 +7,25 @@
 #   smoke     the app's smoke test against the PUBLISHED images, on every platform
 #   scan      Trivy (fails on fixable vulnerabilities at the given severities)
 #   release   GitHub prerelease with images.json (refs + digests + commit) as asset
-#   channel   moves the `stg` tag (input `channel`) to these digests, so stacks
-#             following :stg pick the RC up. Only after the prerelease exists.
+#   channel   optional (input `channel`, default off): move a channel tag such as stg to
+#             these digests after the prerelease exists. Chris deploys with a separate click.
 #
 # The prerelease is created only when everything above passed, and
 # docker-promote.yml only promotes prereleases, so a failed RC can't be promoted.
 #
-# Caller (.github/workflows/release-candidate.yml):
-#   on: { push: { tags: ["v*-rc.*"] } }
+# Caller (.github/workflows/release-candidate.yml), button + tag push:
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         bump: { type: choice, options: [patch, minor, major], default: patch }
+#     push: { tags: ["v*-rc.*"] }
 #   permissions: { contents: write, packages: write, id-token: write, attestations: write }
 #   jobs:
 #     candidate:
-#       uses: christancho/github-workflows/.github/workflows/docker-candidate.yml@v1.1.0
+#       uses: christancho/github-workflows/.github/workflows/docker-candidate.yml@v1.4.0
 #       with:
 #         images: '[{"name":"api","context":".","dockerfile":"api/Dockerfile"}]'
+#         bump: ${{ inputs.bump }}
 #
 # Images: ghcr.io/<owner>/<repo>/<name>. GHCR visibility follows the repo for
 # packages created by this workflow (set it once in package settings if not).
@@ -46,10 +51,17 @@ on:
         description: Trivy severities that fail the RC (only vulnerabilities with a fix count).
         type: string
         default: CRITICAL
-      channel:
-        description: Channel tag moved to every RC that passes. Empty = don't move any.
+      bump:
+        description: >-
+          patch | minor | major: create the next RC tag on the default branch first
+          (e.g. v1.0.0 -> v1.0.1-rc.1, or rc.N+1 if that line exists). Empty = run for the
+          pushed tag.
         type: string
-        default: stg
+        default: ""
+      channel:
+        description: Channel tag moved to every RC that passes. Empty (default) = don't move any; deploy is a separate click.
+        type: string
+        default: ""
       runner:
         description: Runner for the platform-independent jobs.
         type: string
@@ -59,13 +71,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: candidate-${{ github.repository }}-${{ github.ref }}
+  group: candidate-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   validate:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.v.outputs.version }}
       prefix: ${{ steps.v.outputs.prefix }}
@@ -75,15 +89,53 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Next RC version
+        id: next
+        if: inputs.bump != ''
+        env:
+          BUMP: ${{ inputs.bump }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ] || fail "run this from $DEFAULT_BRANCH (got $REF)"
+          latest=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          [[ "${latest:-v0.0.0}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          ma=${BASH_REMATCH[1]} mi=${BASH_REMATCH[2]} pa=${BASH_REMATCH[3]}
+          case "$BUMP" in
+            patch) pa=$((pa + 1)) ;;
+            minor) mi=$((mi + 1)); pa=0 ;;
+            major) ma=$((ma + 1)); mi=0; pa=0 ;;
+            *) fail "bump must be patch, minor or major (got $BUMP)" ;;
+          esac
+          target="v$ma.$mi.$pa"
+          n=$(git tag -l "$target-rc.*" | sed -E 's/.*-rc\.([0-9]+)$/\1/' | grep -E '^[0-9]+$' | sort -n | tail -1)
+          version="$target-rc.$(( ${n:-0} + 1 ))"
+          gh api "repos/$REPO/git/refs" -f ref="refs/tags/$version" -f sha="$SHA" >/dev/null \
+            || fail "could not create tag $version"
+          git fetch -q origin "refs/tags/$version:refs/tags/$version"
+          echo "tag=$version" >> "$GITHUB_OUTPUT"
+          echo "Created $version at $SHA (latest stable: ${latest:-none}, bump: $BUMP)"
+          echo "### Release candidate \`$version\` (from ${latest:-nothing}, $BUMP)" >> "$GITHUB_STEP_SUMMARY"
+
       - id: v
         env:
           REF_TYPE: ${{ github.ref_type }}
-          TAG: ${{ github.ref_name }}
+          PUSHED_TAG: ${{ github.ref_name }}
+          CREATED_TAG: ${{ steps.next.outputs.tag }}
           SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
         run: |
           fail() { echo "::error::$*"; exit 1; }
-          [ "$REF_TYPE" = tag ] || fail "run this from a tag push (got $REF_TYPE)"
+          if [ -n "$CREATED_TAG" ]; then
+            TAG=$CREATED_TAG
+          else
+            [ "$REF_TYPE" = tag ] || fail "push a vX.Y.Z-rc.N tag or set bump (got a $REF_TYPE run)"
+            TAG=$PUSHED_TAG
+          fi
           [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)$ ]] || fail "$TAG is not vX.Y.Z-rc.N"
           stable="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
           git merge-base --is-ancestor "$SHA" origin/main || fail "$TAG points at $SHA, which is not on main"
