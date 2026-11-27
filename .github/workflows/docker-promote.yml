@@ -18,12 +18,12 @@
 #   on:
 #     workflow_dispatch:
 #       inputs:
-#         candidate: { description: "RC to promote, e.g. v1.4.0-rc.2", required: true, type: string }
+#         candidate: { description: "RC to promote (empty = what stg runs now)", required: false, type: string }
 #         dry-run:   { description: "Only run the checks", type: boolean, default: false }
 #   permissions: { contents: write, packages: write, attestations: read }
 #   jobs:
 #     promote:
-#       uses: christancho/github-workflows/.github/workflows/docker-promote.yml@v1.2.0
+#       uses: christancho/github-workflows/.github/workflows/docker-promote.yml@v1.4.0
 #       with:
 #         candidate: ${{ inputs.candidate }}
 #         dry-run: ${{ inputs.dry-run }}
@@ -33,8 +33,9 @@ on:
   workflow_call:
     inputs:
       candidate:
+        description: RC to promote. Empty = the release candidate stg runs now.
         type: string
-        required: true
+        default: ""
       dry-run:
         type: boolean
         default: false
@@ -72,6 +73,7 @@ jobs:
       stable: ${{ steps.check.outputs.stable }}
       commit: ${{ steps.check.outputs.commit }}
       latest: ${{ steps.check.outputs.latest }}
+      candidate: ${{ steps.check.outputs.candidate }}
     steps:
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
@@ -99,13 +101,28 @@ jobs:
         run: |
           fail() { echo "::error::REFUSED: $*"; echo "### REFUSED: $*" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           ok() { echo "ok  $*"; echo "- ✅ $*" >> "$GITHUB_STEP_SUMMARY"; }
-          echo "## Promotion checks for \`$CANDIDATE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Promotion checks" >> "$GITHUB_STEP_SUMMARY"
 
           [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ] || fail "run this from $DEFAULT_BRANCH (got $REF)"
           perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission)
           [[ "$perm" == admin || "$perm" == maintain ]] || fail "$ACTOR has '$perm'; promotion needs admin or maintain"
           ok "started by $ACTOR ($perm) from $DEFAULT_BRANCH"
 
+          if [ -z "$CANDIDATE" ]; then
+            # The RC whose images.json digests are exactly what `stg` serves now.
+            for rc in $(gh release list -R "$REPO" --limit 30 --exclude-drafts --json tagName,isPrerelease \
+                          --jq '.[] | select(.isPrerelease) | .tagName' | sort -Vr); do
+              gh release download "$rc" -R "$REPO" -p images.json -O "$RUNNER_TEMP/probe.json" --clobber 2>/dev/null || continue
+              match=true
+              while read -r image digest; do
+                [ "$(crane digest "$image:stg" 2>/dev/null)" = "$digest" ] || { match=false; break; }
+              done < <(jq -r '.images[] | "\(.image) \(.digest)"' "$RUNNER_TEMP/probe.json")
+              if [ "$match" = true ]; then CANDIDATE=$rc; break; fi
+            done
+            [ -n "$CANDIDATE" ] || fail "stg doesn't run a release candidate; name one in the candidate field"
+            ok "no candidate given: stg runs $CANDIDATE"
+          fi
+          echo "candidate=$CANDIDATE" >> "$GITHUB_OUTPUT"
           [[ "$CANDIDATE" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-rc\.[0-9]+$ ]] || fail "$CANDIDATE is not vX.Y.Z-rc.N"
           stable=${BASH_REMATCH[1]}
 
@@ -164,7 +181,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      CANDIDATE: ${{ inputs.candidate }}
+      CANDIDATE: ${{ needs.validate.outputs.candidate }}
       STABLE: ${{ needs.validate.outputs.stable }}
       COMMIT: ${{ needs.validate.outputs.commit }}
       LATEST: ${{ needs.validate.outputs.latest }}
